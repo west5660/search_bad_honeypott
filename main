@@ -1,0 +1,164 @@
+import asyncio
+import json
+import re
+import os
+import hashlib
+from typing import Set
+from urllib.parse import urlparse, urljoin
+import pandas as pd
+from crowd_sdk.tagme import TagmeClientAdvanced
+from tqdm import tqdm
+
+
+def hash_text(text):
+    # Преобразование текста в байтовую строку
+    text_bytes = text.encode('utf-8')
+    # Вычисление SHA256 хеша
+    sha256_hash = hashlib.sha256(text_bytes).hexdigest()
+    return sha256_hash
+
+
+def construct_config(config: dict) -> dict:
+    if config['netloc'] == 'tagme.apps.prom-gen.sigma.sbrf.ru':
+        config['config_path'] = os.path.expanduser('~/configs/.sigma.cfg')
+        config['task_params'] = ['K3', '-']
+    elif config['netloc'] == 'tagme.sberdevices.ru':
+        config['config_path'] = os.path.expanduser('~/configs/.cloud.cfg')
+    return config
+
+
+def parse_url(tg_url: str) -> dict:
+    parsed_url = urlparse(tg_url)
+    config = parsed_url.path.split('/')
+    try:
+        return {
+            'netloc': parsed_url.netloc,
+            'org_id': config[2],
+            'project_id': config[4],
+            'task_id': config[6]
+        }
+    except IndexError:
+        raise ValueError('Вы ввели некорректный URL.')
+
+
+def parse_url_project(tg_url: str) -> dict:
+    parsed_url = urlparse(tg_url)
+    config = parsed_url.path.split('/')
+    try:
+        return {
+            'netloc': parsed_url.netloc,
+            'org_id': config[2],
+            'project_id': config[4],
+            # 'task_id': config[6]
+        }
+    except IndexError:
+        raise ValueError('Вы ввели некорректный URL.')
+
+
+async def get_all_assignments_in_task(task_url: str) -> pd.DataFrame:
+    task_info = parse_url(task_url)
+    config = construct_config({'netloc': task_info['netloc']})
+    client = TagmeClientAdvanced(config['config_path'])
+    organization_id = task_info.get('org_id')
+    task_id = task_info.get('task_id')
+    all_assignments = await client.get_task_assignments(task_id=task_id, organization_id=organization_id)
+    persons = await client.get_persons(with_organizations=True, organization_id=organization_id)
+    markers_info = {}
+
+    for person in persons:
+        if person.organizations:
+            markers_info.update({
+                person.uid: {
+                    'email': person.email,
+                    'full_name': f'{person.last_name} {person.first_name}'
+                }
+            })
+    # Извлечение данных из all_assignments по пути result/answer/text
+    data = []
+
+    for assignment in tqdm(all_assignments, desc="Обработка", colour='GREEN'):
+        # !!!(Настройка поля для поиска)
+        text = assignment.result['answer']['text']
+        text_hash = hash_text(text)
+        marker_info = markers_info.get(assignment.marker_id, {})
+        data.append({
+            'assignment_id': assignment.assignment_id,
+            'task_id': assignment.task_id,
+            'start_date': assignment.start_date.strftime('%Y-%m-%d %H:%M:%S'),
+            'name': marker_info.get('full_name', ''),
+            'email': marker_info.get('email', ''),
+            'text': text,
+            'text_hash': text_hash
+        })
+
+    df = pd.DataFrame(data, columns=['assignment_id', 'task_id', 'start_date', 'name', 'email', 'text', 'text_hash'])
+    return df
+
+
+async def get_all_tasks_in_project(extracted_df: pd.DataFrame, project_url: str):
+    task_info = parse_url_project(project_url)
+    config = construct_config({'netloc': task_info['netloc']})
+    client = TagmeClientAdvanced(config['config_path'])
+    organization_id = task_info.get('org_id')
+    project_id = task_info.get('project_id')
+    task_all_tasks = await client.get_tasks(project_id=project_id, organization_id=organization_id)
+
+    matching_assignments = []
+
+    for task in tqdm(task_all_tasks, desc="Обработка", colour='GREEN'):
+        try:
+            assignments = await client.get_task_assignments(task_id=task.uid, organization_id=task.organization_id)
+            persons = await client.get_persons(with_organizations=True, organization_id=organization_id)
+            markers_info = {}
+            for person in persons:
+                if person.organizations:
+                    markers_info.update({
+                        person.uid: {
+                            'email': person.email,
+                            'full_name': f'{person.last_name} {person.first_name}'
+                        }
+                    })
+            for assignment in assignments:
+                # Поиск совпадений !!!(Настройка поля для поиска)
+                if 'editedText' not in assignment.result['answer']:
+                    continue
+                edited_text = assignment.result['answer']['editedText']
+                edited_text_hash = hash_text(edited_text)
+                if edited_text_hash in extracted_df['text_hash'].values:
+                    marker_info = markers_info.get(assignment.marker_id, {})
+                    matching_assignments.append({
+                        'assignment_id_now':
+                            extracted_df[extracted_df['text_hash'] == edited_text_hash]['assignment_id'].values[0],
+                        'task_id_now': extracted_df[extracted_df['text_hash'] == edited_text_hash]['task_id'].values[
+                            0],
+                        'start_date_now':
+                            extracted_df[extracted_df['text_hash'] == edited_text_hash]['start_date'].values[0],
+                        'name_now': extracted_df[extracted_df['text_hash'] == edited_text_hash]['name'].values[0],
+                        'email_now': extracted_df[extracted_df['text_hash'] == edited_text_hash]['email'].values[0],
+                        'assignment_id_before': assignment.assignment_id,
+                        'task_id_before': assignment.task_id,
+                        'start_date_before': assignment.start_date.strftime('%Y-%m-%d %H:%M:%S'),
+                        'name_before': marker_info.get('full_name', ''),
+                        'email_before': marker_info.get('email', ''),
+                        'text': edited_text
+                    })
+        except ValueError:
+            print(f"Произошла ошибка при загрузке данных")
+            continue
+    if matching_assignments:
+        combined_df = pd.DataFrame(matching_assignments)
+        combined_df.to_excel('output_file.xlsx', index=False)
+        print('Данные сохранены')
+    else:
+        print('Нет совпадений')
+
+
+async def main():
+    task_url = input("Введите ссылку на задачу: ")
+    extracted_data = await get_all_assignments_in_task(task_url)
+    project_url = input("Введите ссылку на проект: ")
+    await get_all_tasks_in_project(extracted_data, project_url)
+
+
+if __name__ == '__main__':
+    asyncio.run(main())
